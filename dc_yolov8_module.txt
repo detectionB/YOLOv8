@@ -83,4 +83,61 @@ class Detect(nn.Module):
         for i in range(self.nl):
             # Box 분기(cv2)와 Class 분기(cv3)를 합칩니다.
             x[i] = torch.cat((self.cv2[i](x[i]), self.cv3[i](x[i])), 1)
+
         return x
+
+class MDC(nn.Module):
+    """
+    Mixed Downsampling Conv (Image 3 Reflected)
+    구조: CBS(1x1) -> [DWConv(3x3,s2) | CBS(3x3,s2) | MaxPool] -> Concat -> CBS(1x1)
+    """
+    def __init__(self, c1, c2):
+        super().__init__()
+        # 내부 채널 정의 (보통 출력의 절반 정도를 중간 채널로 사용)
+        c_ = c2 // 2
+        
+        # 1. Input Project
+        self.cv1 = CBS(c1, c_, 1, 1)
+
+        # 2. Downsampling
+        # Branch A: Depthwise Conv (groups=c_)
+        self.dw_conv = CBS(c_, c_, 3, 2, g=c_)
+        
+        # Branch B: Standard Conv
+        self.std_conv = CBS(c_, c_, 3, 2)
+        
+        # Branch C: MaxPool (Kernel=3, Stride=2, Padding=1 for alignment)
+        self.maxpool = nn.MaxPool2d(3, stride=2, padding=1)
+
+        # 3. Output Fusion
+        # Concat: c_ + c_ + c_ = 3 * c_
+        self.cv2 = CBS(3 * c_, c2, 1, 1)
+
+    def forward(self, x):
+        x = self.cv1(x)
+        # 3가지 경로 병렬 처리 후 병합
+        return self.cv2(torch.cat([
+            self.dw_conv(x),
+            self.std_conv(x),
+            self.maxpool(x)
+        ], dim=1))
+
+class DC_Block(nn.Module):
+    """DC Block Unit"""
+    def __init__(self, c1, c2):
+        super().__init__()
+        c_ = c2 // 2 
+        self.cv1 = CBS(c1, c2, 1, 1)
+        
+        # Branch 1: Depthwise Conv
+        self.dw_conv = CBS(c2, c_, 3, 1, g=c_) 
+        # Branch 2: Standard CBS
+        self.std_conv = CBS(c2, c_, 3, 1)
+        
+        self.cv2 = CBS(2 * c_, c2, 1, 1)
+
+    def forward(self, x):
+        x = self.cv1(x)
+        x1 = self.dw_conv(x)
+        x2 = self.std_conv(x)
+        return self.cv2(torch.cat([x1, x2], dim=1))
