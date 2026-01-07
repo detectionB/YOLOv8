@@ -1,0 +1,86 @@
+import torch
+import torch.nn as nn
+
+# 1. 기본 합성곱 블록 (Conv + BatchNorm + SiLU)
+# YOLOv8의 가장 기초가 되는 단위입니다.
+class CBS(nn.Module):
+    def __init__(self, c1, c2, k=1, s=1, p=None, g=1, d=1):
+        super().__init__()
+        self.conv = nn.Conv2d(c1, c2, k, s, padding=p if p else k // 2, groups=g, dilation=d, bias=False)
+        self.bn = nn.BatchNorm2d(c2)
+        self.act = nn.SiLU()
+
+    def forward(self, x):
+        return self.act(self.bn(self.conv(x)))
+
+# 2. Bottleneck 블록
+# ResNet처럼 입력을 더해주는(Shortcut) 구조입니다.
+class Bottleneck(nn.Module):
+    def __init__(self, c1, c2, shortcut=True, g=1, k=(3, 3), e=0.5):
+        super().__init__()
+        c_ = int(c2 * e)  # hidden channels
+        self.cv1 = CBS(c1, c_, k[0], 1)
+        self.cv2 = CBS(c_, c2, k[1], 1, g=g)
+        self.add = shortcut and c1 == c2
+
+    def forward(self, x):
+        return x + self.cv2(self.cv1(x)) if self.add else self.cv2(self.cv1(x))
+
+# 3. C2f 모듈 (Cross Stage Partial Network)
+# YOLOv8에서 C3 모듈 대신 도입된 구조로, 풍부한 그래디언트 흐름을 만듭니다.
+class C2f(nn.Module):
+    def __init__(self, c1, c2, n=1, shortcut=False, g=1, e=0.5):
+        super().__init__()
+        self.c = int(c2 * e)  # hidden channels
+        self.cv1 = CBS(c1, 2 * self.c, 1, 1)
+        self.cv2 = CBS((2 + n) * self.c, c2, 1)  # output conv
+        self.m = nn.ModuleList(Bottleneck(self.c, self.c, shortcut, g, k=((3, 3)), e=1.0) for _ in range(n))
+
+    def forward(self, x):
+        # 입력을 반으로 나누고(chunk), 병렬 처리 후 다시 합칩니다(concat).
+        y = list(self.cv1(x).chunk(2, 1))
+        y.extend(m(y[-1]) for m in self.m)
+        return self.cv2(torch.cat(y, 1))
+
+# 4. SPPF (Spatial Pyramid Pooling - Fast)
+# 다양한 크기의 특징을 한 번에 섞어주는 역할을 합니다.
+class SPPF(nn.Module):
+    def __init__(self, c1, c2, k=5):
+        super().__init__()
+        c_ = c1 // 2
+        self.cv1 = CBS(c1, c_, 1, 1)
+        self.cv2 = CBS(c_ * 4, c2, 1, 1)
+        self.m = nn.MaxPool2d(kernel_size=k, stride=1, padding=k // 2)
+
+    def forward(self, x):
+        x = self.cv1(x)
+        y1 = self.m(x)
+        y2 = self.m(y1)
+        y3 = self.m(y2)
+        return self.cv2(torch.cat((x, y1, y2, y3), 1))
+
+# 5. Detect Head (Decoupled Head)
+# 클래스 예측과 박스 좌표 예측을 분리해서 수행합니다.
+class Detect(nn.Module):
+    def __init__(self, nc=80, ch=()):
+        super().__init__()
+        self.nc = nc  # number of classes
+        self.nl = len(ch)  # number of detection layers (P3, P4, P5)
+        self.reg_max = 16  # DFL channels
+        self.no = nc + self.reg_max * 4  # number of outputs per anchor
+
+        # 각 스케일(P3, P4, P5)마다 별도의 Head를 가집니다.
+        c2, c3 = max((16, ch[0] // 4, self.reg_max * 4)), max(ch[0], min(self.nc, 100))  # channels
+        self.cv2 = nn.ModuleList(
+            nn.Sequential(CBS(x, c2, 3), CBS(c2, c2, 3), nn.Conv2d(c2, 4 * self.reg_max, 1)) for x in ch
+        )
+        self.cv3 = nn.ModuleList(
+            nn.Sequential(CBS(x, c3, 3), CBS(c3, c3, 3), nn.Conv2d(c3, self.nc, 1)) for x in ch
+        )
+
+    def forward(self, x):
+        # x는 [P3, P4, P5] 특징 맵 리스트입니다.
+        for i in range(self.nl):
+            # Box 분기(cv2)와 Class 분기(cv3)를 합칩니다.
+            x[i] = torch.cat((self.cv2[i](x[i]), self.cv3[i](x[i])), 1)
+        return x
